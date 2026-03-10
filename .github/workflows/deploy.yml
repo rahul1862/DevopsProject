@@ -1,0 +1,49 @@
+name: Deploy to AWS Elastic Beanstalk
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '18'
+
+    - name: Install dependencies
+      run: npm ci
+
+    - name: Run tests
+      run: npm test
+
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: eu-west-1
+
+    - name: Create EB application
+      run: |
+        aws elasticbeanstalk create-application --application-name "raahuls-app" --description "Math app" || echo "Application already exists"
+
+    - name: Create EB environment
+      run: |
+        aws elasticbeanstalk create-environment --application-name "raahuls-app" --environment-name "production" --solution-stack-name "64bit Amazon Linux 2 v5.8.3 running Node.js 18" || echo "Environment already exists"
+
+    - name: Deploy to EB
+      uses: einaregilsson/beanstalk-deploy@v21
+      with:
+        application_name: raahuls-app
+        environment_name: production
+        region: eu-west-1
+        version_label: ${{ github.sha }}
+        version_description: ${{ github.sha }}
