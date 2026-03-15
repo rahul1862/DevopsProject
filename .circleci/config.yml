@@ -105,9 +105,25 @@ jobs:
       - checkout
 
       - run:
+          name: Confirm Required AWS Variables
+          command: |
+            # Default to eu-west-1 when AWS_REGION isn't set
+            if [ -z "$AWS_REGION" ]; then
+              echo "AWS_REGION not set, defaulting to eu-west-1"
+              export AWS_REGION=eu-west-1
+            fi
+
+            for v in EB_APP_NAME EB_ENV_NAME EB_S3_BUCKET AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY; do
+              if [ -z "${!v}" ]; then
+                echo "Environment variable missing: $v"
+                exit 1
+              fi
+            done
+
+      - run:
           name: Package Application
           command: |
-            zip -r source.zip . -x "node_modules/" ".git/"
+            zip -r source.zip . -x "node_modules/" ".git/" ".circleci/"
 
       - run:
           name: Upload to S3
@@ -213,12 +229,9 @@ workflows:
       - dependency_security_check:
           requires:
             - run_tests
-      - build_and_publish_image:
-          requires:
-            - dependency_security_check
       - deploy_to_eb:
           requires:
-            - build_and_publish_image
+            - dependency_security_check
       - https_validation:
           requires:
             - deploy_to_eb
