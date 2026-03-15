@@ -46,7 +46,13 @@ jobs:
       - run:
           name: Confirm Required AWS Variables
           command: |
-            for v in AWS_REGION AWS_ACCOUNT_ID ECR_REPOSITORY AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY; do
+            # Default to eu-west-1 when AWS_REGION isn't set (common for AWS Academy setups)
+            if [ -z "$AWS_REGION" ]; then
+              echo "AWS_REGION not set, defaulting to eu-west-1"
+              echo 'export AWS_REGION=eu-west-1' >> $BASH_ENV
+            fi
+
+            for v in AWS_ACCOUNT_ID ECR_REPOSITORY AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY; do
               if [ -z "${!v}" ]; then
                 echo "Environment variable missing: $v"
                 exit 1
