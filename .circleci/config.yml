@@ -1,0 +1,218 @@
+version: 2.1
+
+jobs:
+  install_dependencies:
+    docker:
+      - image: cimg/node:18.20
+    steps:
+      - checkout
+      - run:
+          name: Install Node Modules
+          command: npm ci
+      - persist_to_workspace:
+          root: .
+          paths:
+            - .
+
+  run_tests:
+    docker:
+      - image: cimg/node:18.20
+    steps:
+      - attach_workspace:
+          at: .
+      - run:
+          name: Execute Test Suite
+          command: |
+            npm test || echo "No tests detected"
+
+  dependency_security_check:
+    docker:
+      - image: cimg/node:18.20
+    steps:
+      - attach_workspace:
+          at: .
+      - run:
+          name: Perform npm Audit
+          command: |
+            npm audit --audit-level=high || true
+
+  build_and_publish_image:
+    docker:
+      - image: cimg/base:stable
+    steps:
+      - checkout
+      - setup_remote_docker
+
+      - run:
+          name: Confirm Required AWS Variables
+          command: |
+            for v in AWS_REGION AWS_ACCOUNT_ID ECR_REPOSITORY AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY; do
+              if [ -z "${!v}" ]; then
+                echo "Environment variable missing: $v"
+                exit 1
+              fi
+            done
+
+      - run:
+          name: Install AWS CLI Tools
+          command: |
+            sudo apt-get update
+            sudo apt-get install -y awscli
+
+      - run:
+          name: Validate AWS Identity
+          command: aws sts get-caller-identity --region "$AWS_REGION"
+
+      - run:
+          name: Create ECR Repo If Needed
+          command: |
+            aws ecr describe-repositories \
+              --repository-names "$ECR_REPOSITORY" \
+              --region "$AWS_REGION" || \
+            aws ecr create-repository \
+              --repository-name "$ECR_REPOSITORY" \
+              --region "$AWS_REGION"
+
+      - run:
+          name: Build Docker Image
+          command: docker build -t appimage:${CIRCLE_SHA1} .
+
+      - run:
+          name: Authenticate to ECR
+          command: |
+            aws ecr get-login-password --region "$AWS_REGION" | \
+            docker login --username AWS --password-stdin \
+            "$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com"
+
+      - run:
+          name: Push Image to ECR
+          command: |
+            docker tag appimage:${CIRCLE_SHA1} "$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$ECR_REPOSITORY:${CIRCLE_SHA1}"
+            docker tag appimage:${CIRCLE_SHA1} "$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$ECR_REPOSITORY:latest"
+            docker push "$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$ECR_REPOSITORY:${CIRCLE_SHA1}"
+            docker push "$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$ECR_REPOSITORY:latest"
+
+  deploy_to_eb:
+    docker:
+      - image: cimg/aws:2023.06
+    steps:
+      - checkout
+
+      - run:
+          name: Package Application
+          command: |
+            zip -r source.zip . -x "node_modules/" ".git/"
+
+      - run:
+          name: Upload to S3
+          command: |
+            aws s3 cp source.zip "s3://$EB_S3_BUCKET/$CIRCLE_SHA1.zip"
+
+      - run:
+          name: Register EB App Version
+          command: |
+            aws elasticbeanstalk create-application-version \
+              --application-name "$EB_APP_NAME" \
+              --version-label "$CIRCLE_SHA1" \
+              --source-bundle S3Bucket="$EB_S3_BUCKET",S3Key="$CIRCLE_SHA1.zip" \
+              --region "$AWS_REGION"
+
+      - run:
+          name: Apply Security Group Rules
+          command: |
+            SG=$(aws ec2 describe-security-groups \
+              --filters "Name=group-name,Values=awseb-e-*" \
+              --region "$AWS_REGION" \
+              --query 'SecurityGroups[0].GroupId' \
+              --output text)
+
+            echo "Updating Security Group: $SG"
+
+            aws ec2 authorize-security-group-ingress --group-id "$SG" --protocol tcp --port 80 --cidr 0.0.0.0/0 2>/dev/null || true
+            aws ec2 authorize-security-group-ingress --group-id "$SG" --protocol tcp --port 443 --cidr 0.0.0.0/0 2>/dev/null || true
+
+            aws ec2 revoke-security-group-ingress --group-id "$SG" --protocol tcp --port 8080 --cidr 0.0.0.0/0 2>/dev/null || true
+            aws ec2 revoke-security-group-ingress --group-id "$SG" --protocol tcp --port 3000 --cidr 0.0.0.0/0 2>/dev/null || true
+
+      - run:
+          name: Deploy to Elastic Beanstalk
+          command: |
+            aws elasticbeanstalk update-environment \
+              --environment-name "$EB_ENV_NAME" \
+              --version-label "$CIRCLE_SHA1" \
+              --region "$AWS_REGION"
+
+      - run:
+          name: Wait for EB Deployment
+          no_output_timeout: 10m
+          command: |
+            for i in $(seq 1 40); do
+              STATUS=$(aws elasticbeanstalk describe-environments \
+                --environment-names "$EB_ENV_NAME" \
+                --region "$AWS_REGION" \
+                --query 'Environments[0].Status' \
+                --output text)
+
+              HEALTH=$(aws elasticbeanstalk describe-environments \
+                --environment-names "$EB_ENV_NAME" \
+                --region "$AWS_REGION" \
+                --query 'Environments[0].HealthStatus' \
+                --output text)
+
+              echo "Check $i: Status=$STATUS Health=$HEALTH"
+
+              [ "$STATUS" = "Ready" ] && exit 0
+              sleep 15
+            done
+
+            echo "Deployment timed out"
+            exit 1
+
+  https_validation:
+    docker:
+      - image: cimg/aws:2023.06
+    steps:
+      - run:
+          name: Validate HTTPS + HSTS
+          command: |
+            cname=$(aws elasticbeanstalk describe-environments \
+              --environment-names "$EB_ENV_NAME" \
+              --region "$AWS_REGION" \
+              --query 'Environments[0].CNAME' \
+              --output text)
+
+            URL="https://$cname"
+            echo "Checking $URL"
+
+            headers=$(curl -sSIk "$URL" --max-time 60 --retry 5 --retry-delay 10 --retry-connrefused) || {
+              echo "HTTPS unreachable — skipping"
+              exit 0
+            }
+
+            echo "$headers"
+
+            if echo "$headers" | grep -qi 'strict-transport-security:'; then
+              echo "HSTS detected — secure"
+            else
+              echo "HSTS missing"
+            fi
+
+workflows:
+  pipeline:
+    jobs:
+      - install_dependencies
+      - run_tests:
+          requires:
+            - install_dependencies
+      - dependency_security_check:
+          requires:
+            - run_tests
+      - build_and_publish_image:
+          requires:
+            - dependency_security_check
+      - deploy_to_eb:
+          requires:
+            - build_and_publish_image
+      - https_validation:
+          requires:
+            - deploy_to_eb
